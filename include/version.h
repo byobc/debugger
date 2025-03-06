@@ -1,10 +1,10 @@
 #pragma once
 
-#define VERSION_YEAR  2024
-#define VERSION_MONTH 9
-#define VERSION_DAY   10
+#define VERSION_YEAR  2025
+#define VERSION_MONTH 3
+#define VERSION_DAY   5
 
-#define BOARD_REV 3
+#define BOARD_REV 2
 
 struct VersionInfo {
 	uint16_t year;

@@ -43,6 +43,9 @@ enum class CommandType : uint8_t {
 	EnterFastMode = 0xE,
 	DebuggerReset = 0xF,
 	SectorErase = 0x10,
+	Ack = 0x11,
+	Error = 0x12,
+	Print = 0x13,
 	MAX_CMD
 };
 
@@ -69,23 +72,36 @@ struct SectorEraseCmd {
 	uint16_t addr;
 };
 
-struct Command {
-	CommandType ty;
-	union {
-		WriteEEPROMCmd write_eeprom;
-		ReadMemoryCmd read_memory;
-		SetBreakpointCmd set_breakpoint;
-		SectorEraseCmd sector_erase;
-	};
-};
+union Command {
+	WriteEEPROMCmd write_eeprom;
+	ReadMemoryCmd read_memory;
+	SetBreakpointCmd set_breakpoint;
+	SectorEraseCmd sector_erase;
+} body;
 
 #define ERR_NO_CMD -1
 #define ERR_BAD_CMD -2
 #define ERR_BAD_ADDR -3
 #define ERR_BAD_CHECKSUM -4
+#define ERR_NAK -5
 
-// Returns 0 on success and stores the command data in `cmd`.
-// Returns ERR_NO_CMD if no command has been sent yet.
-int get_command(Command &cmd);
+void send_header(CommandType ty, uint16_t len);
+
+inline void send_packet(CommandType ty) {
+	send_header(ty, 0);
+}
+
+void send_packet(CommandType ty, const uint8_t *body, uint16_t len);
+
+template< typename T >
+void send_packet(CommandType ty, const T& body) {
+	send_packet(ty, (const uint8_t *)body, sizeof(T));
+}
+
+int recv_packet(CommandType &ty, uint8_t *buf, uint16_t *len);
+
+void print_debug(const char *s, size_t len);
 
 void hit_breakpoint(uint8_t which);
+
+#define print_lit(STR) print_debug("" STR "", sizeof(STR)-1)

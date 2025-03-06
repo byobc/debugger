@@ -1,6 +1,9 @@
 import sys
 from serial import Serial
 import serial.tools.list_ports
+import serial_asyncio
+import asyncio
+import struct
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
@@ -70,6 +73,9 @@ CMD_GET_CPU_STATE = b'\x0D'
 CMD_ENTER_FAST_MODE = b'\x0E'
 CMD_DEBUGGER_RESET = b'\x0F'
 CMD_SECTOR_ERASE = b'\x10'
+CMD_ACK = b'\x11'
+CMD_ERROR = b'\x12'
+CMD_PRINT = b'\x13'
 
 @dataclass
 class CpuState:
@@ -205,6 +211,55 @@ class PortWrapper:
     def write(self, data: bytes):
         self.port.write(data)
 
+class DebuggerIo:
+    def __init__(self):
+        self.h2d_queue = asyncio.Queue()
+        self.d2h_queue = asyncio.Queue()
+
+        self.acks = asyncio.Semaphore(value=0)
+    
+    async def begin(self, port):
+        self.reader, self.writer = await serial_asyncio.open_serial_connection(url=port, baudrate=115200)
+
+        async with asyncio.TaskGroup() as tg:
+            tx = tg.create_task(self._tx_handler())
+            rx = tg.create_task(self._rx_handler())
+    
+    async def run_cmd(self, ty, cmd):
+        await self.d2h_queue.put((ty, cmd))
+        reply_ty, reply_body = await self.h2d_queue.get()
+        if reply_ty == CMD_ERROR:
+            raise Exception(f'error {ty} {cmd} -> {reply_ty} {reply_body}')
+        elif reply_ty != ty:
+            raise Exception(f'mismatch {ty} {cmd} -> {reply_ty} {reply_body}')
+        return reply_body
+    
+    async def _tx_handler(self):
+        ty, body = await self.h2d_queue.get()
+        self.writer.write(struct.pack('<ccH', b'%', ty, len(body)))
+        await self.acks.acquire()
+        if len(body) > 0:
+            self.writer.write(body)
+            await self.acks.acquire()
+
+    async def _rx_handler(self):
+        while True:
+            magic = await self.reader.read(1)
+            if magic == b'%':
+                break
+        ty = await self.reader.readexactly(1)
+        length = int.from_bytes(await self.reader.readexactly(2), 'little')
+        body = await self.reader.readexactly(length)
+        if ty == CMD_ACK:
+            self.acks.release()
+        elif ty == CMD_PRINT:
+            print('DEBUGGER MSG: ', body)
+        elif ty == CMD_HIT_BREAKPOINT:
+            print('HIT BREAKPOINT: ', body)
+        else:
+            await self.d2h_queue.put((ty, body))
+
+
 EEPROM_PAGE_BITS = 6
 EEPROM_PAGE_SIZE = (1 << EEPROM_PAGE_BITS)
 EEPROM_PAGE_MASK = (EEPROM_PAGE_SIZE - 1)
@@ -223,39 +278,36 @@ class VersionInfo:
         return f'{self.year:04}-{self.month:02}-{self.day:02}'
 
 class Debugger:
-    def __init__(self, port, timeout):
-        self.port = PortWrapper(port, timeout)
+    def __init__(self):
+        self.io = DebuggerIo()
     
-    def start_command(self, b: bytes):
-        assert(len(b) == 1)
-        self.port.write(b)
-        echo = self.port.read_exact(1)
-        if echo != b:
-            raise InvalidHeader(f'expected {b} but found {echo}')
+    async def begin(self, port):
+        await self.io.begin(port)
     
-    @classmethod
-    def open(cls, path):
-        port = Serial(path, 115200, timeout=0.0)
-        return cls(port, 3.0)
-
-    def ping(self) -> bytes:
-        self.start_command(CMD_PING)
-        data = self.port.read_exact(5)
-        return data
+    async def ping(self) -> bytes:
+        return await self.io.run_cmd(CMD_PING, b'')
     
-    def print_info(self) -> VersionInfo:
-        self.start_command(CMD_PRINT_INFO)
-
-        data = self.port.read_exact(4)
+    async def print_info(self) -> VersionInfo:
+        data = await self.io.run_cmd(CMD_PRINT_INFO, b'')
         year  = int.from_bytes(data[0:2], 'little')
         month = int.from_bytes(data[2:3], 'little')
         day   = int.from_bytes(data[3:4], 'little')
         return VersionInfo(year, month, day)
 
-    def page_write(self, page: int, data: bytes):
-        self._raw_page_write(page, data)
-        time.sleep(0.015)
-        written = self.read(page, len(data))
+    async def _raw_page_write(self, page: int, data: bytes):
+        assert page & EEPROM_PAGE_MASK == 0, f'misaligned page {page:04X}'
+        assert len(data) == EEPROM_PAGE_SIZE
+
+        data = page.to_bytes(2, 'little') + data
+        checksum = update_crc(0, data)
+        data = data + checksum.to_bytes(2, 'little')
+
+        await self.io.run_cmd(CMD_WRITE_EEPROM, data)
+
+    async def page_write(self, page: int, data: bytes):
+        await self._raw_page_write(page, data)
+        await asyncio.sleep(0.015)
+        written = await self.read(page, len(data))
         if data != written:
             print('Data mismatch')
 
@@ -295,99 +347,60 @@ class Debugger:
             print()
             raise Exception('data mismatch')
 
-    def _raw_page_write(self, page: int, data: bytes):
-        assert(page & EEPROM_PAGE_MASK == 0), f'misaligned page {page:04X}'
-        assert(len(data) == EEPROM_PAGE_SIZE)
-
-        self.start_command(CMD_WRITE_EEPROM)
-
-        data = page.to_bytes(2, 'little') + data
-        checksum = update_crc(0, data)
-        data = data + checksum.to_bytes(2, 'little')
-
-        self.port.write(data)
-
-        confirm = self.port.read_exact(1)
-        if confirm != b'\x00':
-            raise Exception(confirm)
-
-    def sector_erase(self, sector: int):
-        self.start_command(CMD_SECTOR_ERASE)
-
-        self.port.write(sector.to_bytes(2, 'little'))
+    async def sector_erase(self, sector: int):
+        await self.io.run_cmd(CMD_SECTOR_ERASE, struct.pack('<H', sector))
     
-    def read(self, addr: int, len_bytes: int):
-        assert(len_bytes < 0x1_0000)
-
-        self.start_command(CMD_READ_MEMORY)
-
-        cmd = addr.to_bytes(2, 'little') + len_bytes.to_bytes(2, 'little')
-        self.port.write(cmd)
-
-        data = self.port.read_exact(len_bytes)
-        assert(len(data) == len_bytes)
-        return data
+    async def read(self, addr: int, length: int):
+        return await self.io.run_cmd(CMD_READ_MEMORY, struct.pack('<HH', addr, length))
     
-    def set_breakpoint(self, addr: int):
+    async def set_breakpoint(self, addr: int):
         assert(addr <= 0xFFFF)
 
-        self.start_command(CMD_SET_BREAKPOINT)
-
-        self.port.write(addr.to_bytes(2, 'little'))
-        ok = self.port.read_exact(1)
-        if ok == b'\xFF':
+        bkpt_num = await self.io.run_cmd(CMD_SET_BREAKPOINT, struct.pack(b'<H', addr))
+        if bkpt_num == b'\xFF':
             raise Exception('Too many breakpoints')
-        print(f'Set breakpoint {ok} at address ${addr:04X}')
+        print(f'Set breakpoint {bkpt_num - 1} at address ${addr:04X}')
     
-    def enter_fast_mode(self):
-        self.start_command(CMD_ENTER_FAST_MODE)
+    async def enter_fast_mode(self):
+        await self.io.run_cmd(CMD_ENTER_FAST_MODE, b'')
 
-    def reset_cpu(self):
-        self.start_command(CMD_RESET_CPU)
+    async def reset_cpu(self):
+        await self.io.run_cmd(CMD_RESET_CPU, b'')
     
-    def self_reset(self):
-        self.start_command(CMD_DEBUGGER_RESET)
+    async def self_reset(self):
+        await self.io.run_cmd(CMD_DEBUGGER_RESET, b'')
     
-    def get_bus_state(self) -> BusState:
-        self.start_command(CMD_GET_BUS_STATE)
-
-        state = self.port.read_exact(6)
-        return BusState.from_bytes(state)
+    async def get_bus_state(self) -> BusState:
+        return BusState.from_bytes(await self.io.run_cmd(CMD_GET_BUS_STATE, b''))
     
-    def get_cpu_state(self) -> CpuState:
-        self.start_command(CMD_GET_CPU_STATE)
-
-        state = self.port.read_exact(16)
-        return CpuState.from_bytes(state)
+    async def get_cpu_state(self) -> CpuState:
+        return CpuState.from_bytes(await self.io.run_cmd(CMD_GET_CPU_STATE, b''))
     
     def poll_breakpoint(self):
-        if self.port.read_nonblocking(1) == CMD_HIT_BREAKPOINT:
-            which = self.port.read_exact(1)
-            return which[0]
-        else:
-            return None
+        # TODO:
+        return None
     
-    def step(self):
+    async def step(self):
         while True:
             self.poll_breakpoint()
-            self.step_half_cycle()
+            await self.step_half_cycle()
             self.poll_breakpoint()
-            state = self.get_cpu_state()
+            state = await self.get_cpu_state()
             if state.sync and state.phi2:
                 break
         
-    def step_half_cycle(self):
-        self.start_command(CMD_STEP_HALF_CYCLE)
+    async def step_half_cycle(self):
+        await self.io.run_cmd(CMD_STEP_HALF_CYCLE, b'')
     
-    def step_cycle(self):
-        self.step_half_cycle()
-        state = self.get_cpu_state()
+    async def step_cycle(self):
+        await self.step_half_cycle()
+        state = await self.get_cpu_state()
         if state.phi2:
             return
-        self.step_half_cycle()
+        await self.step_half_cycle()
     
-    def cont(self):
-        self.start_command(CMD_CONTINUE)
+    async def cont(self):
+        await self.io.run_cmd(CMD_CONTINUE, b'')
 
 def are_different_or_none(lhs, rhs):
     if lhs is None:
@@ -427,7 +440,7 @@ def infer_port(default):
 def do_deploy_bin(args):
     return do_deploy(args, is_bin=True)
     
-def do_deploy(args, is_bin=False):
+async def do_deploy(args, is_bin=False):
     if is_bin:
         if args.file.lower().endswith('.s'):
             print('Warning: .S files usually are text, not binary, and should not be used with --bin!')
@@ -449,7 +462,8 @@ def do_deploy(args, is_bin=False):
             sys.exit(1)
 
     print('Connecting to debugger')
-    dbg = Debugger.open(infer_port(args.port))
+    dbg = Debugger()
+    await dbg.open(infer_port(args.port))
     try:
         print(f'Firmware version: {dbg.print_info()}')
         print('Successfully connected to debugger!')
@@ -507,8 +521,8 @@ def do_deploy(args, is_bin=False):
     
     for base, end in sectors.items():
         for i in range(base, end):
-            dbg.sector_erase(base * EEPROM_SECTOR_SIZE)
-            time.sleep(0.100)
+            await dbg.sector_erase(base * EEPROM_SECTOR_SIZE)
+            await asyncio.sleep(0.1)
             print('.', end='', flush=True)
     print()
 
@@ -523,20 +537,20 @@ def do_deploy(args, is_bin=False):
             data = data + b'\xFF'
         
         for page in range(0, len(data), EEPROM_PAGE_SIZE):
-            dbg.page_write(base_addr + page, data[page:][:EEPROM_PAGE_SIZE])
+            await dbg.page_write(base_addr + page, data[page:][:EEPROM_PAGE_SIZE])
             print('.', end='', flush=True)
     print()
 
     print('Resetting debugger...')
     
-    dbg.self_reset()
+    await dbg.self_reset()
 
     print('Done!')
 
 
     pass
 
-def do_debug(args):
+async def do_debug(args):
     try:
         with open('asm.lst', 'r') as f:
             lst_data = f.read()
@@ -559,17 +573,17 @@ def do_debug(args):
     print('Connecting to debugger')
     dbg = Debugger.open(infer_port(args.port))
     try:
-        print(f'Firmware version: {dbg.print_info()}')
+        print(f'Firmware version: {await dbg.print_info()}')
         print('Successfully connected to debugger!')
     except TimeoutError:
         try:
-            print(f'Firmware version: {dbg.print_info()}')
+            print(f'Firmware version: {await dbg.print_info()}')
             print('Successfully connected to debugger')
         except TimeoutError:
             print('Timed out while trying to connect to debugger')
             return
 
-    dbg.reset_cpu()
+    await dbg.reset_cpu()
 
     last_cmd = ''
 
@@ -580,7 +594,7 @@ def do_debug(args):
             try:
                 while True:
                     if walking:
-                        dbg.step_half_cycle()
+                        await dbg.step_half_cycle()
 
                     which_breakpoint = dbg.poll_breakpoint()
 
@@ -591,16 +605,16 @@ def do_debug(args):
                             print(f'Hit breakpoint {which_breakpoint}, stopping')
                         break
                     
-                    time.sleep(0.1)
+                    await asyncio.sleep(0.1)
             except KeyboardInterrupt:
                 print('Keyboard interrupt, stopping')
-                dbg.step_half_cycle()
+                await dbg.step_half_cycle()
             
             free_running = False
             walking = False
 
-        state = dbg.get_bus_state()
-        cpu_state = dbg.get_cpu_state()
+        state = await dbg.get_bus_state()
+        cpu_state = await dbg.get_cpu_state()
 
         if cpu_state.pc is not None and listing is not None:
             for line in listing.neighborhood(cpu_state.pc):
@@ -654,7 +668,16 @@ def do_debug(args):
         print()
         '''
 
-        cmd = input('> ')
+        input_queue = asyncio.Queue()
+
+        def get_input():
+            while True:
+                input_queue.put_nowait(input(''))
+        
+        await asyncio.to_thread(get_input)
+
+        print('> ', end='')
+        cmd = await input_queue.get()
         if cmd != '':
             last_cmd = cmd
 
@@ -670,25 +693,25 @@ def do_debug(args):
             elif cmd in ('s', 'step'):
                 free_running = False
                 dbg.poll_breakpoint()
-                dbg.step()
+                await dbg.step()
             elif cmd in ('h', 'stephalf'):
                 free_running = False
                 dbg.poll_breakpoint()
-                dbg.step_half_cycle()
+                await dbg.step_half_cycle()
             elif cmd in ('y', 'stepcycle'):
                 free_running = False
                 dbg.poll_breakpoint()
-                dbg.step_cycle()
+                await dbg.step_cycle()
             elif cmd in ('c', 'continue'):
                 free_running = True
-                dbg.cont()
+                await dbg.cont()
             elif cmd in ('w', 'walk'):
                 free_running = True
                 walking = True
             elif cmd in ('q'):
                 break
             elif cmd in ('r', 'reset'):
-                dbg.reset_cpu()
+                await dbg.reset_cpu()
             elif cmd in ('b', 'break'):
                 if len(args) > 1:
                     print('Too many arguments')
@@ -698,7 +721,7 @@ def do_debug(args):
                     loc = args[0]
                     if loc.startswith('$'):
                         addr = int(loc[1:], base=16)
-                        dbg.set_breakpoint(addr)
+                        await dbg.set_breakpoint(addr)
                     elif listing is not None:
                         assert(symbol_table is not None)
                         if loc in symbol_table.symbols:
@@ -707,13 +730,13 @@ def do_debug(args):
                             line_number = int(loc)
                             addr = listing.line_to_addr(line_number)
                         if addr is not None:
-                            dbg.set_breakpoint(addr)
+                            await dbg.set_breakpoint(addr)
                         else:
                             print('No such line or symbol in file')
                     else:
                         print('Cannot set breakpoint on line without source info (provide a listing file)')
             elif cmd in ('f', 'fast'):
-                dbg.enter_fast_mode()
+                await dbg.enter_fast_mode()
                 print('Entered fast mode, press reset button to debug again')
                 break
             else:
@@ -749,7 +772,7 @@ def main():
 
     args = parser.parse_args()
 
-    args.func(args)
+    asyncio.run(args.func(args))
 
     return
 

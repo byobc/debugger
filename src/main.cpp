@@ -176,18 +176,21 @@ enum class Wait {
 static Wait WAIT = Wait::HalfCycle;
 
 Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
+  CommandType ty;
   Command cmd;
   while (true) {
-    int result = get_command(cmd);
+    uint16_t msg_len = sizeof(cmd);
+    int result = recv_packet(ty, (uint8_t *)&cmd, &msg_len);
     if (result == ERR_NO_CMD) {
       return Action::None;
     } else if (result != 0) {
+      send_packet(CommandType::Error);
       continue;
     }
 
-    switch (cmd.ty) {
+    switch (ty) {
     case CommandType::Ping:
-      uart::put_bytes("Pong!", 5);
+      send_packet(CommandType::Ping, (const uint8_t *)"Pong!", 5);
       break;
     case CommandType::WriteEEPROM:
       gpio::set_addr_bus_mode(gpio::AddressBusMode::DebuggerDriven);
@@ -197,6 +200,7 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
         programmer::byte_program(cmd.write_eeprom.addr + i, cmd.write_eeprom.data[i]);
       }
 
+      send_packet(CommandType::WriteEEPROM);
       return Action::Stop;
     case CommandType::SectorErase:
       gpio::set_addr_bus_mode(gpio::AddressBusMode::DebuggerDriven);
@@ -204,6 +208,7 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
 
       programmer::sector_erase(cmd.sector_erase.addr);
 
+      send_packet(CommandType::SectorErase, nullptr, 0);
       break;
     case CommandType::ReadMemory:
       gpio::write_we(true);
@@ -212,6 +217,7 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
 
       delay_loop(5);
 
+      send_header(CommandType::ReadMemory, cmd.read_memory.len);
       for (uint16_t i = 0; i < cmd.read_memory.len; ++i) {
         uint16_t addr = i + cmd.read_memory.addr;
 
@@ -226,14 +232,15 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
       break;
     case CommandType::SetBreakpoint:
       if (NUM_BREAKPOINTS == MAX_BREAKPOINTS) {
-        uart::put(0xFF);
+        const uint8_t err = 0xFF;
+        send_packet(CommandType::SetBreakpoint, &err, 1);
         break;
       }
 
-      uart::put(NUM_BREAKPOINTS);
       BREAKPOINTS[NUM_BREAKPOINTS].addr = cmd.set_breakpoint.addr;
       BREAKPOINTS[NUM_BREAKPOINTS].enabled = true;
       ++NUM_BREAKPOINTS;
+      send_packet(CommandType::SetBreakpoint, (const uint8_t *)&NUM_BREAKPOINTS, 1);
       break;
     case CommandType::ResetCpu:
       RESB_PORT.OUTCLR = RESB_PIN_MASK;
@@ -241,6 +248,7 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
       cpu.error = false;
       cpu.mode = physicalw65c02::Mode::IMPLIED;
       cpu.oper = physicalw65c02::Oper::W65C02S_OPER_NOP;
+      send_packet(CommandType::ResetCpu);
       break;
     case CommandType::GetBusState: {
       BusState state = {
@@ -250,23 +258,27 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
         0
       };
 
-      uart::put_bytes(reinterpret_cast<uint8_t*>(&state), sizeof(BusState));
+      send_packet(CommandType::GetBusState, state);
       break;
     }
     case CommandType::StepHalfCycle: {
+      send_packet(CommandType::StepHalfCycle);
       return Action::StepHalfCycle;
     }
     case CommandType::StepCycle: {
+      send_packet(CommandType::StepCycle);
       return Action::StepCycle;
     }
     case CommandType::Step: {
+      send_packet(CommandType::Step);
       return Action::Step;
     }
     case CommandType::Continue: {
+      send_packet(CommandType::Continue);
       return Action::Continue;
     }
     case CommandType::PrintInfo: {
-      uart::put_bytes(reinterpret_cast<const uint8_t*>(&VERSION), sizeof(VERSION));
+      send_packet(CommandType::PrintInfo, VERSION);
       break;
     }
     case CommandType::GetCpuState: {
@@ -291,20 +303,22 @@ Action handle_commands(PhysicalW65C02 &cpu, bool phi2) {
       state.oper = (uint8_t)cpu.oper;
       state.seq_cycle = cpu.seq_cycle;
 
-      uart::put_bytes(reinterpret_cast<const uint8_t*>(&state), sizeof(CpuState));
+      send_packet(CommandType::GetCpuState, state);
       break;
     }
     case CommandType::EnterFastMode: {
+      send_packet(CommandType::EnterFastMode);
       return Action::EnterFastMode;
-      break;
     }
     case CommandType::DebuggerReset: {
       // Wait for TX data register empty
+      send_packet(CommandType::DebuggerReset);
       delay_millis(100);
       sw_reset();
       break;
     }
     default:
+      send_packet(CommandType::Error);
       break;
     }
 

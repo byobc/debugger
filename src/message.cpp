@@ -2,73 +2,86 @@
 #include "uart.h"
 #include "crc.h"
 
-int get_command(Command &cmd) {
-	int msg_type = uart::get_nonblocking();
-	if (msg_type == -1) {
-		return ERR_NO_CMD;
-	}
+const uint8_t PKT_MAGIC = '%';
 
-	if (msg_type == 0 || msg_type >= static_cast<int>(CommandType::MAX_CMD)) {
-		return ERR_BAD_CMD;
-	}
+void send_header(CommandType ty, uint16_t len) {
+	uart::put(PKT_MAGIC);
+	uart::put((uint8_t)ty);
+	uart::put(len);
+	uart::put(len >> 8);
+}
 
-	auto cmd_type = static_cast<CommandType>(msg_type);
-	cmd.ty = cmd_type;
+static void send_ack() {
+	send_header(CommandType::Ack, 0);
+}
 
-	// Echo back the message type to tell the host to send the rest of the command
-	uart::put(msg_type);
-
-	switch (cmd_type) {
-	case CommandType::Ping:
-		break;
-	case CommandType::WriteEEPROM: {
-		uart::get_bytes(reinterpret_cast<uint8_t*>(&cmd.write_eeprom), sizeof(WriteEEPROMCmd));
-		uint16_t rx_crc = cmd.write_eeprom.checksum;
-		uint16_t calc_crc = update_crc(0, reinterpret_cast<uint8_t*>(&cmd.write_eeprom), 2 + 64);
-		if (rx_crc != calc_crc) {
-			uart::put(ERR_BAD_CHECKSUM);
-			return ERR_BAD_CHECKSUM;
+// returns negative on failure
+static int recv_header(CommandType &ty, uint16_t &len) {
+	uint8_t magic;
+	do {
+		magic = uart::get_nonblocking();
+		if (magic < 0) {
+			return ERR_NO_CMD;
 		}
-		if (cmd.write_eeprom.addr & ((1 << 6) - 1)) {
-			uart::put(ERR_BAD_ADDR);
-			return ERR_BAD_ADDR;
+	} while (magic != PKT_MAGIC);
+
+	ty = static_cast< CommandType >(uart::get());
+	len  = uart::get();
+	len |= uart::get() << 8;
+	return 0;
+}
+
+// TODO: Do I even need acks in this direction?
+static int recv_ack() {
+	CommandType ty;
+	uint16_t len;
+	while (recv_header(ty, len) < 0) {}
+	if (ty == CommandType::Ack) {
+		return 0;
+	} else {
+		return 0;
+	}
+}
+
+void send_packet(CommandType ty, const uint8_t *body, uint16_t len) {
+	send_header(ty, len);
+	uart::put_bytes(body, len);
+}
+
+int recv_packet(CommandType &ty, uint8_t *buf, uint16_t *len) {
+	uint16_t buf_len = *len;
+	uint16_t msg_len;
+	int err;
+
+	if ((err = recv_header(ty, msg_len)) < 0) {
+		return err;
+	}
+	send_ack();
+
+	if (msg_len > 0) {
+		if (msg_len > buf_len) {
+			// can't possibly be valid, just read and discard
+			for (uint16_t i = 0; i < msg_len; ++i) {
+				uart::get();
+				send_ack();
+			}
+			return ERR_BAD_CMD;
+		} else {
+			for (uint16_t i = 0; i < msg_len; ++i) {
+				buf[i] = uart::get();
+			}
+			send_ack();
 		}
-
-		uart::put(0);
-		break;
-	}
-	case CommandType::ReadMemory: {
-		uart::get_bytes(reinterpret_cast<uint8_t*>(&cmd.read_memory), 2 * sizeof(uint16_t));
-		break;
-	}
-	case CommandType::SetBreakpoint: {
-		uart::get_bytes(reinterpret_cast<uint8_t*>(&cmd.set_breakpoint), sizeof(SetBreakpointCmd));
-		break;
-	}
-	case CommandType::SectorErase: {
-		uart::get_bytes(reinterpret_cast<uint8_t*>(&cmd.sector_erase), sizeof(SectorEraseCmd));
-		break;
-	}
-	case CommandType::ResetCpu:
-		break;
-	case CommandType::GetBusState:
-		break;
-	case CommandType::Step:
-	case CommandType::StepHalfCycle:
-	case CommandType::StepCycle:
-	case CommandType::Continue:
-	case CommandType::PrintInfo:
-	case CommandType::GetCpuState:
-	case CommandType::DebuggerReset:
-		break;
-	case CommandType::MAX_CMD:
-		break;
 	}
 
+	*len = msg_len;
 	return 0;
 }
 
 void hit_breakpoint(uint8_t which) {
-	uart::put((uint8_t)CommandType::HitBreakpoint);
-	uart::put(which);
+	(void)send_packet(CommandType::HitBreakpoint, &which, 1);
+}
+
+void print_debug(const char *s, size_t len) {
+	send_packet(CommandType::Print, (const uint8_t *)s, len);
 }
