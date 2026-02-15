@@ -620,9 +620,9 @@ def do_debug(args):
         elif cpu_state.in_irq:
             print('IRQ')
 
-        print(f'PC: {cpu_state.pc:04X}  A: {cpu_state.a:02X} X: {cpu_state.x:02X} Y: {cpu_state.y:02X} P: {cpu_state.p:02X} S: {cpu_state.s:02X} seq_cycle: {cpu_state.seq_cycle}')
-        print(f'ADDR: {cpu_state.addr:04X}')
-        print(f'DATA:   {cpu_state.data:02X}')
+        print(f'PC: ${cpu_state.pc:04X}  A: ${cpu_state.a:02X} X: ${cpu_state.x:02X} Y: ${cpu_state.y:02X} P: ${cpu_state.p:02X} S: ${cpu_state.s:02X} seq_cycle: {cpu_state.seq_cycle}')
+        print(f'ADDR: ${cpu_state.addr:04X}')
+        print(f'DATA:   ${cpu_state.data:02X}')
         print(f'STATUS: ', end='')
         print('SYNC:1 ' if cpu_state.sync else 'sync:0 ', end='')
         print('rwb:1 (R) ' if cpu_state.rwb else 'RWB:0 (W)', end='')
@@ -667,7 +667,7 @@ def do_debug(args):
         try:
             if cmd in ('reload_cpu_state', ):
                 pass
-            elif cmd in ('help'):
+            elif cmd in ('help',):
                 print("""Available commands:
 break      (b): create breakpoint
 step (s/enter): step 1 instruction
